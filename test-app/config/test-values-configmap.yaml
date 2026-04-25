@@ -1,0 +1,33 @@
+# Test values ConfigMap — lightweight subset of production values.
+# Substitution placeholders are resolved by Flux postBuild at reconcile time.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-values
+  # Must be in flux-system to be resolvable by the HelmRelease valuesFrom reference.
+  # (Flux HelmRelease valuesFrom does not support cross-namespace ConfigMap lookup.)
+  namespace: flux-system
+data:
+  values.yaml: |
+    # ACR image pull
+    imagePullSecrets:
+      - name: acr-pull-token
+
+    # Workload identity for the test build SA
+    workloadIdentity:
+      clientId: "${BUILD_MI_CLIENT_ID}"
+
+    # Frontend bundle location in test storage
+    frontend:
+      bundle:
+        storageAccountName: "${STORAGE_ACCOUNT_NAME}"
+        containerName: "frontend"
+        blobPath: "dist.tar.gz"
+
+    # Minimal env for test — no PG, no full secrets
+    commonEnv:
+      ACR_LOGIN_SERVER: "${ACR_LOGIN_SERVER}"
+      DEPLOYMENT_TYPE: "AKS"
+      LOG_LEVEL: "INFO"
+      DEBUG: "True"
+      STORAGE_ACCOUNT_NAME: "${STORAGE_ACCOUNT_NAME}"

@@ -1,0 +1,284 @@
+# ServiceAccount for the test build job (workload identity federated to test-build-sa)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: test-build-sa
+  namespace: default
+  annotations:
+    azure.workload.identity/client-id: "${BUILD_MI_CLIENT_ID}"
+  labels:
+    azure.workload.identity/use: "true"
+automountServiceAccountToken: true
+---
+# Frontend build Job — pulls source image from ACR, builds assets, uploads bundle to Blob.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: frontend-build-test
+  namespace: default
+  labels:
+    app: frontend-build
+    environment: test
+spec:
+  ttlSecondsAfterFinished: 7200
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: frontend-build
+        environment: test
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: test-build-sa
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: acr-pull-token
+      # ── initContainer: build React assets ─────────────────────────────────
+      initContainers:
+        - name: build
+          image: ${ACR_LOGIN_SERVER}/plant360-ui-src:test
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "[build] Starting React frontend build..."
+              export NODE_OPTIONS="--max-old-space-size=3584"
+              npm run build
+              echo "[build] Packaging dist/ into /build-out/dist.tar.gz..."
+              tar czf /build-out/dist.tar.gz -C /app/dist .
+              echo "[build] Bundle size: $(wc -c < /build-out/dist.tar.gz) bytes"
+              echo "[build] Done."
+          env:
+            - name: VITE_APP_SERVER_BASE_URL
+              value: "/api"
+            - name: VITE_APP_GPU_SERVER_URL
+              value: "/api"
+            - name: VITE_APP_RTM_SERVER_URL
+              value: "/centrifugo"
+            - name: VITE_APP_EMBEDDINGS_URL
+              value: "/api"
+            - name: VITE_APP_ANALYTICS_URL
+              value: "/analytics/events"
+            - name: VITE_APP_USE_ANALYTICS
+              value: "true"
+            - name: VITE_APP_CHANGE_IQ_ENABLED
+              value: "true"
+            - name: VITE_APP_UNIGRAPH_EXPORT_ENABLED
+              value: "false"
+            - name: VITE_APP_ERROR_SUPPORT_URL
+              value: "https://coditation.com/contact/"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "3Gi"
+            limits:
+              cpu: "1000m"
+              memory: "4Gi"
+          volumeMounts:
+            - name: build-output
+              mountPath: /build-out
+      # ── main container: upload bundle to Azure Blob ────────────────────────
+      containers:
+        - name: uploader
+          image: ${ACR_LOGIN_SERVER}/azure-cli:2.71.0
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "[uploader] Starting Azure Blob upload..."
+
+              if [ -z "${AZURE_FEDERATED_TOKEN_FILE:-}" ] || [ ! -r "$AZURE_FEDERATED_TOKEN_FILE" ]; then
+                echo "[uploader] ERROR: workload identity token file not found" >&2
+                exit 1
+              fi
+
+              echo "[uploader] Logging in via workload identity..."
+              az login \
+                --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" \
+                --service-principal \
+                --username "$AZURE_CLIENT_ID" \
+                --tenant "$AZURE_TENANT_ID" \
+                --output none
+
+              echo "[uploader] Uploading dist.tar.gz to blob storage..."
+              az storage blob upload \
+                --account-name "$STORAGE_ACCOUNT_NAME" \
+                --container-name frontend \
+                --name dist.tar.gz \
+                --file /build-out/dist.tar.gz \
+                --auth-mode login \
+                --overwrite true \
+                --output none
+
+              echo "[uploader] Upload complete."
+              az storage blob show \
+                --account-name "$STORAGE_ACCOUNT_NAME" \
+                --container-name frontend \
+                --name dist.tar.gz \
+                --auth-mode login \
+                --query '{size: properties.contentLength, lastModified: properties.lastModified}' \
+                -o table
+          env:
+            - name: STORAGE_ACCOUNT_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: test-frontend-env
+                  key: STORAGE_ACCOUNT_NAME
+            # AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE are injected
+            # automatically by the Azure Workload Identity webhook when the pod has
+            # label azure.workload.identity/use: "true" and the SA has the client-id annotation.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "200m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: build-output
+              mountPath: /build-out
+      volumes:
+        - name: build-output
+          emptyDir: {}
+---
+# ConfigMap: runtime env for the uploader container.
+# Substitution values injected by Flux postBuild.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-frontend-env
+  namespace: default
+data:
+  STORAGE_ACCOUNT_NAME: "${STORAGE_ACCOUNT_NAME}"
+---
+# Frontend serving Deployment — mounts the bundle from blob (via init-container extract)
+# and serves with a static file server. Runs in default namespace.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-test
+  namespace: default
+  labels:
+    app: frontend-test
+    environment: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend-test
+  template:
+    metadata:
+      labels:
+        app: frontend-test
+        environment: test
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: test-build-sa
+      imagePullSecrets:
+        - name: acr-pull-token
+      # Fetch bundle from blob before serving
+      initContainers:
+        - name: fetch-bundle
+          image: ${ACR_LOGIN_SERVER}/azure-cli:2.71.0
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "[fetch-bundle] Downloading frontend bundle..."
+
+              if [ -z "${AZURE_FEDERATED_TOKEN_FILE:-}" ] || [ ! -r "$AZURE_FEDERATED_TOKEN_FILE" ]; then
+                echo "[fetch-bundle] ERROR: workload identity token file not found" >&2
+                exit 1
+              fi
+
+              az login \
+                --federated-token "$(cat "$AZURE_FEDERATED_TOKEN_FILE")" \
+                --service-principal \
+                --username "$AZURE_CLIENT_ID" \
+                --tenant "$AZURE_TENANT_ID" \
+                --output none
+
+              az storage blob download \
+                --account-name "$STORAGE_ACCOUNT_NAME" \
+                --container-name frontend \
+                --name dist.tar.gz \
+                --file /srv/dist.tar.gz \
+                --auth-mode login \
+                --output none
+
+              echo "[fetch-bundle] Extracting bundle..."
+              mkdir -p /srv/www
+              tar xzf /srv/dist.tar.gz -C /srv/www
+              echo "[fetch-bundle] Bundle ready at /srv/www"
+              ls /srv/www | head -5
+          env:
+            - name: STORAGE_ACCOUNT_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: test-frontend-env
+                  key: STORAGE_ACCOUNT_NAME
+            # AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE are injected
+            # by the Azure Workload Identity webhook.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "200m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: web-root
+              mountPath: /srv
+      containers:
+        - name: server
+          image: ${ACR_LOGIN_SERVER}/nginx:stable-alpine
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: web-root
+              mountPath: /usr/share/nginx/html
+              subPath: www
+      volumes:
+        - name: web-root
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-test
+  namespace: default
+  labels:
+    app: frontend-test
+    environment: test
+spec:
+  selector:
+    app: frontend-test
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: ClusterIP
